@@ -1,0 +1,550 @@
+---
+title: "R Journal Entry Analysis"
+author: "HHH"
+date: '2024 2 20'
+output: 
+  word_document:
+    reference_docx: "template.docx"
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+options(scipen = 999) # change the number display from scientific notation to the full number in digits
+
+
+## 한글 폰트 설정 - 구글 폰트 페이지(https://fonts.google.com/)의 폰트 사용
+if(!require(showtext)){install.packages("showtext");library(showtext)}
+library(showtext)
+# font 등록
+font_add_google(name = "Noto Serif KR",
+                family = "noto-serif")
+# showtext 기능 켜기
+showtext_auto(TRUE)
+```
+
+
+# Step 1.    테스트 개요 및 목적  
+  
+  
+재무제표에 대한 회계감사의 일환으로 감사대상기간 동안 발생한 모든 전표 데이터에 대한 무결성 및 비경상적인 거래가 존재하는지를 검증
+  
+(1) 계정명(FSLI)  :    전체 계정
+(2) 기준일 (Coverage date)  :    2017-01-01 ~ 2017-12-31
+(3) 테스트되는 경영자의 주장 (Assertion)  :    완전성 (C),정확성 (A),기간귀속구분 (CO),실재성 (E/O),권리 (R),공시(PD),평가(V)
+  
+# Step 2.    Test 대상 모집단
+  
+(1) 전체 전표를 포함하는 분개장.  
+(2) 모집단의 완전성 확인  :  Step 5. Test 결과의 A01, A02, A03 참조
+   
+# Step 3.    오류의 정의
+   
+재무보고 프로세스 관련, 부적절하거나 비경상적인 분개 및 수정사항  
+   
+# Step 4.    Test 방법  
+  
+* A01 . Data Integrity 검증 - 데이터 유효성을 검증하고, record에 대한 이해를 위한 절차  
+  
+전표 데이터의 회계기간이 당해년도에 포함되는지 여부 검토  
+전표 주요 필드값의 누락 여부 검토를 통한 data integrity 검토  
+  
+* A02. 전표번호 별 차대변 일치검증  
+전표번호 별 차변금액과 대변금액이 일치하는지 확인하여 전표 데이터의 완전성을 검토  
+차변금액과 대변금액이 일치하지 않을 경우 해당 전표를 추출하여 회사 측과 확인  
+  
+* A03. 시산표 Reconciliation 검증(Trial Balance Rollforward Test)   
+기초 F/S잔액에 수령한 모든 전표의 계정과목 별 합계금액을 반영하여 도출한 기말 F/S 잔액과 회사 제시 F/S와의 일치 여부 검토  
+  
+* B01. 매출의 상대계정분석(매출과 연관성이 낮은 계정이 포함된 비정상적인 거래)  
+매출에 대한 상대계정분석 결과 비정상적으로 처리된 회계처리가 있는지 검토하고 해당 전표 중 특정 금액 이상인 건을 추출하여 검토  
+
+# Step 5.    Test 결과   
+    
+## Test 준비
+
+### readxl, lubridate, skimr, tidyverse 패키지를 불러온다. 
+   
+```{r, eval=TRUE, echo=FALSE, include=TRUE}
+library(readxl)
+library(writexl)
+library(skimr)
+library(tidyverse)
+
+```
+    
+    
+### load Journal Entry data
+    
+* Journal Entry data 객체 load 하고 확인  
+    
+```{r}
+je_raw <- read_csv('je_utf_colname.txt') 
+je_raw
+
+```
+   
+
+### 프로그램에 맞추어 열 이름 변경
+    
+* change column name
+
+    
+```{r}
+je_tbl <- rename(je_raw, JEDATE = 전표일자,
+                         JENO = 전표번호,
+                         DR = 차변금액,
+                         CR = 대변금액,
+                         ACCTCD = 계정코드,
+                         ACCT_NM = 계정과목명)
+
+je_tbl <- je_tbl %>% 
+  mutate(across(DR:CR, \(x) ifelse(is.na(x), 0, x)),
+         JEDATE = ymd(JEDATE),
+         month = as_factor(month(JEDATE)),
+         ACCTCD = as_factor(ACCTCD),
+         JENO = as.character(JENO)
+)
+
+sum(je_tbl$DR) == sum(je_tbl$CR)
+```
+
+
+## A01 Data Integrity Test  
+    
+* Data skim 확인
+    
+```{r}
+
+skim(je_tbl)
+
+```
+
+  
+## A02 전표번호 별 차대변 일치검증    
+     
+* 전표번호, 차변금액, 대변금액 열을 선택(select)한다. 선택한 세 개의 열에 Null 값 (NA)이 있으면 0으로 모두 바꾼다.(mutate_all)    
+전표번호별로 묶어서(group_by) 전표번호별 차변의 합계를 DR_sum의 열 이름으로 전표번호별 대변의 합계를 CR_sum의 열 이름으로 정리한다.(summarise)   
+전표번호별 차변 금액과 대변 금액 합계를 각각 차이를 계산하여 Differ라는 열 이름으로 추가(mutate)한다.   
+    
+* 전표번호별 차변 금액 합계와 대변 금액 합계의 차이 Differ열의 전체 합계를 계산한다.   
+* 계산한 차이가 0이 아닌 행을 나타낸다.  
+    
+    
+```{r}
+A02 <- je_tbl %>%  
+    select(JENO, DR, CR) %>%  
+    # mutate_all(~replace(., is.na(.), 0)) %>%  
+    group_by(JENO) %>% 
+    summarise(DR_sum=sum(DR),
+              CR_sum=sum(CR)) %>%  
+    mutate(Differ= DR_sum - CR_sum)
+# print(A02)
+print(A02)
+
+A02 %>% filter(Differ != 0)   
+```
+   
+   
+## A03 시산표 Reconciliation 검증(Trial Balance Rollforward Test)  
+     
+     
+### 시산표 data 준비.   
+   
+* 당기 시산표 불러오기
+* 전기 시산표 불러오기
+* 당기시산표 columns별 결측값 확인
+* 전기시산표 columns별 결측값 확인
+   
+    
+```{r}
+cytb_raw <- read_excel('CYTB.xlsx')
+pytb_raw <- read_excel('PYTB.xlsx')
+colSums(is.na(cytb_raw))
+colSums(is.na(pytb_raw))
+```
+   
+   
+* 결측값(Null, NA)이 ACCTCD 열에 있었으며 결측값 때문에 join에 어려움이 발생할 수 있으므로 결측을 없애고 시작한다.
+* 전기 시산표에서도 결측을 없앤다.
+* 결측을 없애고 나서 View(CYTB) 기능으로 읽어들인 시산표를 보니 99행이 시산표 중 재무상태표의 마지막 행이다. 시산표의 재무상태표 부분을 나누어 새로운 객체를 생성하기 위하여 1행 부터 99행까지를 썰어낸다.(slice)
+* 시산표의 손익계산서 부분을 뜯어내어 새로운 객체를 생성하기 위하여 100행부터 끝까지 썰어낸다.
+* 시산표에서 썰어낸(slice) 당기재무상태표 하단을 확인한다. 재무상태표 끝단이 썰렸는지 확인.
+* 시산표에서 썰어낸(slice) 당기손익계산서 상단을 확인한다. 손익계산서 시작점부터 썰렸는지 확인.
+* 전기시산표에서 썰어낸 전기재무상태표 하단을 확인한다. 재무상태표 끝단이 썰렸는지 확인.
+* 전기 시산표의 재무상태표 부분 slice   
+* 당기시산표에 전기 시산표의 재무상태표 부분을 계정과목별로 맞춰서 붙인다(join). 이 때 당기시산표에 있는 계정과 전기시산표에 있는 계정이 모두 포함되도록 붙여야 한다. 전기에 변동이 있었으나 당기에 변동이 없었던 항목이 누락되지 않아야 하기 때문이다.
+* 시산표의 손익계산서 부분은 당기에 발생한 잔액만 있으면 된다. 재무상태표처럼 기초잔액이라는 개념이 없다.
+* 재무상태표의 잔액에서 기초잔액을 제거한 결과와 시산표의 손익계산서 부분의 잔액을 합하여 전표에서 당기에 변동이 있었던 금액을 하나로 붙인다.
+   
+   
+```{r}
+cytb_tbl <- drop_na(cytb_raw, ACCTCD)
+pytb_tbl <- drop_na(pytb_raw, ACCTCD)
+  
+CYTB_FP <- cytb_tbl %>% 
+    slice(1:99)
+CYTB_PL <- cytb_tbl %>% 
+    slice(100:n())
+PYTB_FP <- pytb_tbl %>% 
+    slice(1:103)
+  
+tail(CYTB_FP)
+head(CYTB_PL)
+tail(PYTB_FP)
+  
+CYTB_FP_move <- full_join(CYTB_FP, PYTB_FP, by='ACCTCD')  %>%  
+    mutate_all(~replace(., is.na(.), 0)) %>% 
+    mutate(move = (DRSUM.x - CRSUM.x) -(DRSUM.y - CRSUM.y)) %>% 
+    select(ACCTCD, move)
+
+CYTB_PL_move <- CYTB_PL %>% 
+    mutate(move = (DRSUM - CRSUM)) %>% 
+    select(ACCTCD, move)
+
+CYTB_move <- bind_rows(CYTB_FP_move, CYTB_PL_move)
+    
+```
+    
+* 전표에서 계정과목별 차변금액과 대변금액 합계를 계산하여 준비한다.
+* 시산표에서 준비한 당기 변동금액(전표에서 계산한 계정과목별 당기 변동 금액)을 전표에서 계산한 차변금액과 대변 금액의 합계에 붙인다.
+* 차이가 0보다 큰 항목 갯수 확인.
+* A03 객체에서 차이가 0이 아닌 항목을 찾아 나타낸다. 이익잉여금 항목 하나만 나타나면 이 외의 계정은 모두 일치한다.
+   
+   
+```{r}
+A03 <- je_tbl %>% 
+    select(ACCTCD, DR, CR) %>% 
+    mutate_all(~replace(., is.na(.), 0)) %>% 
+    group_by(ACCTCD) %>% 
+    summarise(DR_sum=sum(DR),
+              CR_sum=sum(CR)) %>% 
+    ungroup() %>%
+    # join 할때 자료형 일치
+    mutate(ACCTCD = as.character(ACCTCD))
+
+A03 <- left_join(A03, CYTB_move, by = 'ACCTCD')
+A03 <- A03 %>% mutate_all(~replace(.,is.na(.), 0)) %>% 
+    mutate(Differ = (DR_sum - CR_sum - move))
+
+ac_name <- je_tbl %>% 
+  distinct(ACCTCD, ACCT_NM) %>% 
+  mutate(ACCTCD=as.character(ACCTCD))
+
+A03 <- left_join(A03, ac_name, by='ACCTCD')
+
+print(A03)
+
+A03 %>% filter(Differ != 0)
+```
+   
+   
+### Lead Schedule xlsx 생성
+   
+```{r}
+amt_sum <- je_tbl %>% 
+  mutate_all(~replace(., is.na(.), 0)) %>% 
+  summarise(
+    DR_sum = sum(DR),
+    CR_sum = sum(CR),
+    .by = ACCT_NM
+  ) %>% arrange(ACCT_NM)
+
+amt_sum %>% write_xlsx("lead_s.xlsx")
+```
+
+   
+## B01 매출의 상대계정분석   
+   
+* 상대계정분석에서 기준이 되는 본계정코드를 설정한다.
+* 전표 데이터에서 본계정이 포함된 전표번호를 필터링(filter)한다. (행 선택)
+* 전표 데이터에서 전표번호와 계정코드 열을 선택(select)한다. (열 선택)
+* 선택한 전표번호와 계정코드에서 본계정이 포함된 전표번호만 남겨서 B09 변수로 지정한다.
+* 본계정과 상대계정의 전표 갯수를 세어 B09 변수로 지정한다.
+    
+    
+```{r}
+Corr_Acc = '40401'
+B09_main <- je_tbl %>% filter(ACCTCD == Corr_Acc) %>% 
+    select(JENO, ACCTCD, ACCT_NM)
+B09_Corr <- je_tbl %>% 
+    select(JENO, ACCTCD)
+B09 <- semi_join(B09_Corr, B09_main, by = 'JENO')
+B09 <- B09 %>% filter(!is.na(ACCTCD)) %>% 
+    count(ACCTCD)
+```
+   
+   
+계정과목명 확인  
+   
+* 계정코드와 계정과목명 열을 선택한다. 중복되는 계정과목명을 삭제하고 하나씩만 남긴다.
+* 계정코드에 맞는 계정과목명을 B09 에 붙인다.
+    
+
+```{r}
+acct_nm <- je_tbl %>% 
+  select(ACCTCD, ACCT_NM) %>% 
+  distinct()
+
+B09 <- B09 %>% left_join(acct_nm, by='ACCTCD')
+```
+
+* 제품매출의 상대계정에 어울리지 않는 계정과목이 있는지 확인한다.  
+
+```{r}
+print(B09)
+```
+
+    
+# Conclusion  
+    
+전표 분석 결과 Step3에서 정의한 오류 사항이 발견되지 아니함.  
+    
+
+
+  
+    
+
+
+# 이 외의 Analysis
+
+
+## 벤포드의 법칙
+
+* 벤포드 분석
+
+```{r}
+if(!require(benford.analysis)){install.packages("benford.analysis");library(benford.analysis)}
+
+je_sales <- je_tbl %>%  
+  filter(ACCTCD == '40401')
+
+je_sales$CR %>% benford()
+```
+
+* 벤포드 분석 결과 Plot 확인
+
+```{r}
+bl <- je_sales$CR %>% benford()
+plot(bl)
+```
+
+
+
+## 매출액 계정별 비중 확인
+
+```{r}
+CYTB_PL %>% 
+  slice(1:5) %>% 
+  select(ACCTCD) %>% 
+  left_join(ac_name, by = 'ACCTCD') %>% 
+  left_join(amt_sum, by = 'ACCT_NM') %>% 
+  ggplot(aes(x="", y=CR_sum, fill=ACCT_NM)) +
+    geom_bar(stat="identity", width=1) +
+    coord_polar("y", start=0)+
+    scale_y_continuous(labels = scales::comma)+
+    labs(title = "매출 계정별 비중",
+         x = "",
+         y = "금액",
+         fill = "매출 계정")
+```
+
+매출액 계정 중 제품매출의 비중이 가장 크다.
+
+
+## 매출 월별 추세 분석
+
+
+* 제품매출 월별 추세 분석
+
+```{r}
+## 월별 추세 분석 사용자함수 설정
+trend <- \(acc){
+  je_tbl %>% 
+    filter(ACCTCD %in% acc) %>% 
+    summarise(
+      amount = sum(CR),
+      .by = month
+    ) %>% ggplot(aes(x=month, y=amount))+
+    geom_col()+
+    scale_y_continuous(labels = scales::comma)+
+    theme_bw()
+}
+```
+
+
+```{r}
+acc = '40401'  ## 제품매출 계정
+trend(acc) + 
+  geom_hline(yintercept = 700000000)
+```
+
+
+* 상품매출 월별 추세 분석
+
+```{r}
+acc <- "40100"
+trend(acc) + 
+  geom_hline(yintercept = 700000000)
+```
+
+
+* 교육 수입 월별 추세 분석
+
+```{r}
+acc <- "40700"
+trend(acc) + 
+  geom_hline(yintercept = 700000000)
+```
+
+
+* 총 매출 계정별 월별 추세 분석 - bar plot (stack)
+
+```{r}
+acc <- c("40100", "40401", "40700", "41100", "41200")
+
+je_tbl %>% 
+    filter(ACCTCD %in% acc) %>% 
+    summarise(
+      amount = sum(CR),
+      .by = c(ACCTCD, month)
+    ) %>% 
+    ggplot(aes(x=month, y=amount, fill=ACCTCD))+
+    geom_bar(position='stack', stat = "sum")+
+    scale_y_continuous(labels = scales::comma)+
+    theme_bw()
+
+```
+
+
+* 총 매출 계정별 box plot - 수치형 변수의 범주별 통계요약
+
+```{r}
+acc <- c("40100", "40401", "40700", "41100", "41200")   # 매출 계정 모음
+
+je_tbl %>% 
+  filter(ACCTCD %in% acc) %>% 
+  mutate(ACCTCD = as.factor(ACCTCD)) %>% 
+  ggplot(aes(x=ACCTCD, y=CR))+
+    geom_boxplot()
+```
+
+
+## 제품매출 거래처 갯수 확인
+
+```{r}
+je_tbl %>%
+  filter(ACCT_NM == '제품매출') %>% 
+  select(`거래처[코드]`) %>% 
+  distinct(`거래처[코드]`) %>% 
+  count()
+```
+
+
+## 원재료비 월별 추세 분석
+
+```{r}
+acc = '50100'
+
+je_tbl %>% 
+  filter(ACCTCD==acc) %>% 
+  mutate(month = as.factor(month(JEDATE))) %>% 
+  summarise(
+    amount = sum(DR),
+    .by = month
+  ) %>% ggplot(aes(x=month, y=amount))+
+  geom_col()+
+  scale_y_continuous(labels = scales::comma)+
+  theme_bw()
+```
+
+
+## 매출액 MUS(Monetary Unit Selection) Sampling - E/O
+
+* MUS Sampling 함수 설치 및 library Load
+
+```{r}
+if(!require(devtools)){install.packages("devtools")}
+if(!require(rsmsampling)){devtools::install_github("joy-hhh/rsmsampling");library(rsmsampling)}
+# ?mus_sampling
+# ?m_ran_sampling
+# ?ran_sampling
+```
+
+
+* Parameters Setting
+
+```{r}
+SR <- "No"          ## or  "Yes"
+RC <- "Yes"         ## or  "No"
+PL <- 4             ## "Analytical.Procedures.Not.Performed" 4  ,    "High" 1, "Low" 2, "Moderate" 3 
+am <- "CR"          ## 금액열 지정
+
+## 수행중요성 금액 및 허용오류율(5% 등) 입력
+PM <- 700000000     ## Tolerable misstatement (generally performance materiality)
+EA <- 0.05          ## Expected misstatement
+```
+
+
+* 모집단 filter 및 Sampling 수행
+
+```{r}
+## Define Population
+acc <- c("40100", "40401", "40700", "41100", "41200")  # 총 매출 계정 모음
+
+population <- je_tbl %>% 
+  filter(ACCTCD %in% acc)
+
+## 함수 실행
+sampling <- mus_sampling(population, am, SR, RC, PL, PM, EA) # population : 샘플링 대상 모집단
+
+## 샘플링 내역 확인
+print(sampling, n = Inf)
+
+## 추출된 샘플 엑셀 파일 생성
+sampling %>% write_xlsx("MUS_sample.xlsx")
+```
+
+
+## 매출액 Cut-off Test Sampling - C/O
+
+12월 매출액에 대하여 Cut-off 목적으로 Test Sampling
+
+```{r}
+## Define Population
+acc <- c("40100", "40401", "40700", "41100", "41200")  # 총 매출 계정 모음
+
+co_sampling <- je_tbl %>% 
+  filter(ACCTCD %in% acc) %>% 
+  filter(month == 12) %>% 
+  ran_sampling(30)
+
+## MUS sampling과 중복 항목 제거
+co_sampling <- co_sampling %>% 
+  filter(!JENO %in% sampling$JENO)
+
+co_sampling
+
+co_sampling %>% write_xlsx("CO_sample.xlsx")
+```
+
+
+
+
+## 분개장 전표에서 매출 계정별 원장 추출 - 엑셀로 저장
+
+```{r}
+acc <- c("40100", "40401", "40700", "41100", "41200")
+
+je_tbl %>% 
+  filter(ACCTCD %in% acc) %>%
+  split(.$ACCT_NM) %>% 
+  write_xlsx(path = "revenue_gl.xlsx")
+```
+
+
+
+
+
+
